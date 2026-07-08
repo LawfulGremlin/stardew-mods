@@ -1,0 +1,180 @@
+name: Stardew mod release
+
+on:
+  workflow_call:
+    inputs:
+      project_path:
+        required: true
+        type: string
+      manifest_path:
+        required: false
+        type: string
+        default: ''
+      dotnet_version:
+        required: false
+        type: string
+        default: 6.0.x
+      reference_repo:
+        required: false
+        type: string
+        default: LawfulGremlin/stardew-dll
+      update_repo:
+        required: false
+        type: string
+        default: LawfulGremlin/stardew-mods
+      update_path:
+        required: false
+        type: string
+        default: mods/update-keys.json
+    secrets:
+      DLL_REPO_TOKEN:
+        required: true
+      STARDEW_MODS_TOKEN:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mod
+        uses: actions/checkout@v4
+
+      - name: Checkout reference DLLs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.reference_repo }}
+          token: ${{ secrets.DLL_REPO_TOKEN }}
+          path: ci/refs
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Read manifest
+        id: manifest
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_PATH"])
+          manifest_path = Path(os.environ["MANIFEST_PATH"] or project.parent / "manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+          asset_prefix = Path(manifest["EntryDll"]).stem
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"name={manifest['Name']}\n")
+              output.write(f"unique_id={manifest['UniqueID']}\n")
+              output.write(f"version={manifest['Version']}\n")
+              output.write(f"asset_prefix={asset_prefix}\n")
+          PY
+
+      - name: Build
+        run: dotnet build "${{ inputs.project_path }}" -c Release -p:GamePath="$PWD/ci/refs" -p:EnableModDeploy=false
+
+      - name: Stage mod folder
+        run: |
+          rm -rf staging
+          mkdir -p staging
+          project_dir="$(dirname "${{ inputs.project_path }}")"
+          zip="$(find "$project_dir/bin/Release" -name '*.zip' -type f -print -quit)"
+          test -n "$zip" || { echo "No release zip found under $project_dir/bin/Release"; exit 1; }
+          echo "zip=$zip" >> "$GITHUB_ENV"
+          unzip -o "$zip" -d staging
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.manifest.outputs.asset_prefix }}
+          path: staging/
+          if-no-files-found: error
+
+      - name: Check release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          test "$GITHUB_REF_NAME" = "v${{ steps.manifest.outputs.version }}" || {
+            echo "Tag $GITHUB_REF_NAME does not match manifest version ${{ steps.manifest.outputs.version }}."
+            exit 1
+          }
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PREFIX: ${{ steps.manifest.outputs.asset_prefix }}
+          RELEASE_TITLE: ${{ steps.manifest.outputs.name }} ${{ steps.manifest.outputs.version }}
+        run: |
+          asset="$ASSET_PREFIX-${GITHUB_REF_NAME}.zip"
+          cp "$zip" "$asset"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" \
+              --title "$RELEASE_TITLE" \
+              --generate-notes
+          fi
+
+      - name: Publish SMAPI update key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.STARDEW_MODS_TOKEN }}
+          UPDATE_REPO: ${{ inputs.update_repo }}
+          UPDATE_PATH: ${{ inputs.update_path }}
+          MOD_ID: ${{ steps.manifest.outputs.unique_id }}
+          MOD_NAME: ${{ steps.manifest.outputs.name }}
+          MOD_VERSION: ${{ steps.manifest.outputs.version }}
+          MOD_PAGE: https://github.com/${{ github.repository }}/releases
+        run: |
+          meta="$(mktemp)"
+          body="$(mktemp)"
+          if ! gh api "repos/$UPDATE_REPO/contents/$UPDATE_PATH?ref=main" > "$meta"; then
+            : > "$meta"
+          fi
+          python - "$meta" "$body" "$MOD_PAGE/tag/$GITHUB_REF_NAME" <<'PY'
+          import base64, json, os, sys
+
+          meta_path, body_path, tag_page = sys.argv[1:]
+          current = ""
+          data = {}
+          sha = None
+
+          try:
+              with open(meta_path, encoding="utf-8") as f:
+                  meta = json.load(f)
+              current = base64.b64decode(meta.get("content", "")).decode("utf-8-sig")
+              data = json.loads(current) if current.strip() else {}
+              sha = meta.get("sha")
+          except Exception:
+              pass
+
+          data["Format"] = "4.0.0"
+          data.setdefault("Mods", {})[os.environ["MOD_ID"]] = {
+              "Name": os.environ["MOD_NAME"],
+              "ModPageUrl": os.environ["MOD_PAGE"],
+              "Versions": [{"Version": os.environ["MOD_VERSION"], "ModPageUrl": tag_page}],
+          }
+
+          content = json.dumps(data, indent=2) + "\n"
+          if content == current:
+              open(body_path, "w", encoding="utf-8").close()
+              sys.exit()
+
+          body = {
+              "message": f"Update {os.environ['MOD_NAME']} SMAPI update key to {os.environ['MOD_VERSION']}",
+              "content": base64.b64encode(content.encode()).decode(),
+              "branch": "main",
+          }
+          if sha:
+              body["sha"] = sha
+          with open(body_path, "w", encoding="utf-8") as f:
+              json.dump(body, f)
+          PY
+          if [ -s "$body" ]; then
+            gh api "repos/$UPDATE_REPO/contents/$UPDATE_PATH" --method PUT --input "$body" > /dev/null
+          else
+            echo "SMAPI update key already current."
+          fi
