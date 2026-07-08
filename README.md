@@ -1,2 +1,3 @@
 # stardew-mods
-Release-only Stardew Valley mod sync bundle
+
+SMAPI update manifests for LawfulGremlin Stardew Valley mods.
